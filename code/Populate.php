@@ -7,6 +7,7 @@ use SilverStripe\Assets\File;
 use SilverStripe\Control\Director;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Config\Configurable;
+use SilverStripe\Core\Environment;
 use SilverStripe\Core\Extensible;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\Dev\YamlFixture;
@@ -43,6 +44,19 @@ class Populate
     private static array $clearedTables = [];
 
     /**
+     * Dir location where the cache files should be stored.
+     * This directory should be included in the repositories .gitignore if it is configured to be within repo scope
+     */
+    private static ?string $populate_cache_files_location = null;
+
+    /**
+     * Array of files that should be included when calculating the hash of the populate state.
+     * This should include the .yml file where the populate config is set
+     *
+     */
+    private static array $populate_cache_hash_files = [];
+
+    /**
      * @param bool $force - allows you to bypass the ran check to run this multiple times
      * @throws Exception
      */
@@ -58,31 +72,107 @@ class Populate
             throw new Exception('requireRecords can only be run in development or test environments');
         }
 
-        /** @var PopulateFactory $factory */
-        $factory = Injector::inst()->create(PopulateFactory::class);
+        $baseDir = Director::baseFolder();
+        $populateHash = self::getPopulateHash();
+        $populateCacheFile = sprintf(
+            '%s/%s/%s.sql',
+            $baseDir,
+            self::config()->get('populate_cache_files_location'),
+            $populateHash
+        );
 
-        foreach (self::config()->get('truncate_objects') as $className) {
-            self::truncateObject($className);
+        if (file_exists($populateCacheFile)) {
+            DB::alteration_message('Cache file located. Populating DB from cached SQL file.');
+            $execCommand = sprintf(
+                "mysql --user=%s --password=%s %s < %s",
+                Environment::getEnv('SS_DATABASE_USERNAME'),
+                Environment::getEnv('SS_DATABASE_PASSWORD'),
+                Environment::getEnv('SS_DATABASE_NAME'),
+                $populateCacheFile
+            );
+
+            exec($execCommand, $output);
+            DB::alteration_message('Populate data imported using cached SQL file.');
+        } else {
+            /** @var PopulateFactory $factory */
+            $factory = Injector::inst()->create(PopulateFactory::class);
+
+            foreach (self::config()->get('truncate_objects') as $className) {
+                self::truncateObject($className);
+            }
+
+            foreach (self::config()->get('truncate_tables') as $table) {
+                self::truncateTable($table);
+            }
+
+            foreach (self::config()->get('include_yaml_fixtures') as $fixtureFile) {
+                DB::alteration_message(sprintf('Processing %s', $fixtureFile), 'created');
+                $fixture = new YamlFixture($fixtureFile);
+                $fixture->writeInto($factory);
+
+                $fixture = null;
+            }
+
+            $factory->processFailedFixtures();
+
+            $populate = Injector::inst()->create(Populate::class);
+            $populate->extend('onAfterPopulateRecords');
         }
 
-        foreach (self::config()->get('truncate_tables') as $table) {
-            self::truncateTable($table);
+        if (!file_exists($populateCacheFile)) {
+            DB::alteration_message('No populate cache file found. Creating cached SQL file.');
+
+            $location = sprintf(
+                '%s/%s',
+                $baseDir,
+                self::config()->get('populate_cache_files_location')
+            );
+
+            if ($location) {
+                if (!file_exists($location)) {
+                    mkdir($location);
+                }
+                $execCommand = sprintf(
+                    "mysqldump --user=%s --password=%s --host=%s %s --result-file=%s 2>&1",
+                    Environment::getEnv('SS_DATABASE_USERNAME'),
+                    Environment::getEnv('SS_DATABASE_PASSWORD'),
+                    Environment::getEnv('SS_DATABASE_SERVER'),
+                    Environment::getEnv('SS_DATABASE_NAME'),
+                    sprintf('%s%s.sql', $location, $populateHash)
+                );
+
+                exec($execCommand, $output);
+
+                var_dump($output);
+            } else {
+                DB::alteration_message('No cache file directory has been set. Populate cache file has not been created');
+            }
+        } else {
+            DB::alteration_message('Skipping cached populate file creation - Populate cache file already exists.');
         }
-
-        foreach (self::config()->get('include_yaml_fixtures') as $fixtureFile) {
-            DB::alteration_message(sprintf('Processing %s', $fixtureFile), 'created');
-            $fixture = new YamlFixture($fixtureFile);
-            $fixture->writeInto($factory);
-
-            $fixture = null;
-        }
-
-        $factory->processFailedFixtures();
-
-        $populate = Injector::inst()->create(Populate::class);
-        $populate->extend('onAfterPopulateRecords');
 
         return true;
+    }
+
+    /**
+     * Calculate a hash of the current state of the populate config.
+     * This function generates a sha256 hash based on the `git hash-object` strings created for each file specified in
+     * `populate_cache_hash_files` and `include_yaml_fixtures`
+     */
+    private static function getPopulateHash(): string
+    {
+        $baseDir = Director::baseFolder();
+        $hashFiles = self::config()->get('populate_cache_hash_files');
+        $hashFiles = array_merge($hashFiles, self::config()->get('include_yaml_fixtures'));
+
+        $hashFiles = array_map(function ($value) use ($baseDir) {
+            return sprintf('%s/%s', $baseDir, $value);
+        }, $hashFiles);
+
+        $execCommand = sprintf('git hash-object %s', implode(' ', $hashFiles));
+        exec($execCommand, $hashes);
+
+        return hash('sha256', serialize($hashes));
     }
 
     /**
@@ -188,6 +278,6 @@ class Populate
         }
 
         // Check if developer/s have specified that Populate can run on live
-        return (bool) self::config()->get('allow_build_on_live');
+        return (bool)self::config()->get('allow_build_on_live');
     }
 }
