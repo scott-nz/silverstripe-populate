@@ -46,6 +46,8 @@ class Populate
     /**
      * Dir location where the cache files should be stored.
      * This directory should be included in the repositories .gitignore if it is configured to be within repo scope
+     * If this variable starts with a / the location will be treated as an abolute location from the root of the server
+     * if the variable does not start with a / the location will be prefixed by Director::baseFolder()
      */
     private static ?string $populate_cache_files_location = null;
 
@@ -72,16 +74,35 @@ class Populate
             throw new Exception('requireRecords can only be run in development or test environments');
         }
 
-        $baseDir = Director::baseFolder();
-        $populateHash = self::getPopulateHash();
-        $populateCacheFile = sprintf(
-            '%s/%s/%s.sql',
-            $baseDir,
-            self::config()->get('populate_cache_files_location'),
-            $populateHash
-        );
+        $cacheLocation = self::config()->get('populate_cache_files_location');
+        $cacheFileExists = false;
 
-        if (file_exists($populateCacheFile)) {
+        if ($cacheLocation) {
+            $populateHash = self::getPopulateHash();
+
+            if (str_starts_with($cacheLocation, '/')) {
+                $populateCacheFile = sprintf(
+                    '%s%s%s.sql',
+                    $cacheLocation,
+                    str_ends_with($cacheLocation, '/') ? '' : '/',
+                    $populateHash
+                );
+            } else {
+                $baseDir = Director::baseFolder();
+                $populateCacheFile = sprintf(
+                    '%s/%s%s%s.sql',
+                    $baseDir,
+                    $cacheLocation,
+                    str_ends_with($cacheLocation, '/') ? '' : '/',
+                    $populateHash
+                );
+            }
+
+
+            $cacheFileExists = file_exists($populateCacheFile);
+        }
+
+        if ($cacheFileExists) {
             DB::alteration_message('Cache file located. Populating DB from cached SQL file.');
             $execCommand = sprintf(
                 "mysql --user=%s --password=%s %s < %s",
@@ -119,26 +140,24 @@ class Populate
             $populate->extend('onAfterPopulateRecords');
         }
 
-        if (!file_exists($populateCacheFile)) {
-            DB::alteration_message('No populate cache file found. Creating cached SQL file.');
+        if (!$cacheFileExists) {
+            DB::alteration_message('No populate cache file found.');
 
-            $location = sprintf(
-                '%s/%s',
-                $baseDir,
-                self::config()->get('populate_cache_files_location')
-            );
-
-            if ($location) {
-                if (!file_exists($location)) {
-                    mkdir($location);
+            if ($cacheLocation) {
+                if (!file_exists($cacheLocation)) {
+                    DB::alteration_message(
+                        sprintf('Cache directory does not exist. Creating directory at `%s`.',$cacheLocation)
+                    );
+                    mkdir($cacheLocation);
                 }
+
                 $execCommand = sprintf(
                     "mysqldump --user=%s --password=%s --host=%s %s --result-file=%s 2>&1",
                     Environment::getEnv('SS_DATABASE_USERNAME'),
                     Environment::getEnv('SS_DATABASE_PASSWORD'),
                     Environment::getEnv('SS_DATABASE_SERVER'),
                     Environment::getEnv('SS_DATABASE_NAME'),
-                    sprintf('%s%s.sql', $location, $populateHash)
+                    sprintf('%s%s.sql', $cacheLocation, $populateHash)
                 );
 
                 exec($execCommand, $output);
