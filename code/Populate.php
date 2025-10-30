@@ -4,6 +4,7 @@ namespace DNADesign\Populate;
 
 use Exception;
 use SilverStripe\Assets\File;
+use SilverStripe\Control\Controller;
 use SilverStripe\Control\Director;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Config\Configurable;
@@ -64,6 +65,7 @@ class Populate
      */
     public static function requireRecords(bool $force = false): bool
     {
+
         if (self::$ran && !$force) {
             return true;
         }
@@ -76,8 +78,12 @@ class Populate
 
         $cacheLocation = self::config()->get('populate_cache_files_location');
         $cacheFileExists = false;
+        $controller = Controller::curr();
+        $request = $controller->getRequest();
+        $ignoreCache = $request->getVar('ignoreCache');
+        $overrideCache = $request->getVar('overrideCache');
 
-        if ($cacheLocation) {
+        if ($cacheLocation && !$ignoreCache) {
             $populateHash = self::getPopulateHash();
 
             if (str_starts_with($cacheLocation, '/')) {
@@ -98,11 +104,17 @@ class Populate
                 );
             }
 
-
             $cacheFileExists = file_exists($populateCacheFile);
+
+            if ($overrideCache && $cacheFileExists) {
+                DB::alteration_message('Cache file exists, cacheOverride variable has been set.');
+                DB::alteration_message(sprintf('Deleting file `%s`', $populateCacheFile));
+                unlink($populateCacheFile);
+                $cacheFileExists = false;
+            }
         }
 
-        if ($cacheFileExists) {
+        if ($cacheFileExists && !$ignoreCache) {
             DB::alteration_message('Cache file located. Populating DB from cached SQL file.');
             $execCommand = sprintf(
                 "mysql --user=%s --password=%s %s < %s",
@@ -115,6 +127,9 @@ class Populate
             exec($execCommand, $output);
             DB::alteration_message('Populate data imported using cached SQL file.');
         } else {
+            if ($cacheFileExists && $ignoreCache) {
+                DB::alteration_message('Task has been configured to ignore cached SQL file.');
+            }
             /** @var PopulateFactory $factory */
             $factory = Injector::inst()->create(PopulateFactory::class);
 
@@ -140,7 +155,7 @@ class Populate
             $populate->extend('onAfterPopulateRecords');
         }
 
-        if (!$cacheFileExists) {
+        if (!$ignoreCache && !$cacheFileExists) {
             DB::alteration_message('No populate cache file found.');
 
             if ($cacheLocation) {
