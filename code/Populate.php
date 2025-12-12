@@ -45,19 +45,23 @@ class Populate
     private static array $clearedTables = [];
 
     /**
+     * Set to true to enable the creating and use of cached SQL files
+     */
+    private static bool $sql_cache_enabled = false;
+
+    /**
      * Dir location where the cache files should be stored.
      * This directory should be included in the repositories .gitignore if it is configured to be within repo scope
-     * If this variable starts with a / the location will be treated as an abolute location from the root of the server
+     * If this variable starts with a / the location will be treated as an absolute location from the root of the server
      * if the variable does not start with a / the location will be prefixed by Director::baseFolder()
      */
-    private static ?string $populate_cache_files_location = null;
+    private static string $cache_files_location = '.populate_sql_cache';
 
     /**
      * Array of files that should be included when calculating the hash of the populate state.
      * This should include the .yml file where the populate config is set
-     *
      */
-    private static array $populate_cache_hash_files = [];
+    private static array $cache_hash_files = [];
 
     /**
      * @param bool $force - allows you to bypass the ran check to run this multiple times
@@ -76,112 +80,40 @@ class Populate
             throw new Exception('requireRecords can only be run in development or test environments');
         }
 
-        $cacheLocation = self::config()->get('populate_cache_files_location');
+        $cacheEnabled = self::config()->get('sql_cache_enabled');
+        $cacheLocation = self::config()->get('cache_files_location');
         $cacheFileExists = false;
+
         $controller = Controller::curr();
         $request = $controller->getRequest();
         $ignoreCache = $request->getVar('ignoreCache');
-        $overrideCache = $request->getVar('overrideCache');
 
-        if ($cacheLocation && !$ignoreCache) {
-            $populateHash = self::getPopulateHash();
+        if ($cacheEnabled && $cacheLocation && !$ignoreCache) {
+            DB::alteration_message('SQL cache for populate task enabled.');
+            DB::alteration_message('Checking to see if an SQL file already exists.');
 
-            if (str_starts_with($cacheLocation, '/')) {
-                $populateCacheFile = sprintf(
-                    '%s%s%s.sql',
-                    $cacheLocation,
-                    str_ends_with($cacheLocation, '/') ? '' : '/',
-                    $populateHash
-                );
-            } else {
-                $baseDir = Director::baseFolder();
-                $populateCacheFile = sprintf(
-                    '%s/%s%s%s.sql',
-                    $baseDir,
-                    $cacheLocation,
-                    str_ends_with($cacheLocation, '/') ? '' : '/',
-                    $populateHash
-                );
-            }
-
-            $cacheFileExists = file_exists($populateCacheFile);
-
-            if ($overrideCache && $cacheFileExists) {
-                DB::alteration_message('Cache file exists, cacheOverride variable has been set.');
-                DB::alteration_message(sprintf('Deleting file `%s`', $populateCacheFile));
-                unlink($populateCacheFile);
-                $cacheFileExists = false;
-            }
+            $cacheFileExists = self::cacheFileExists();
         }
 
-        if ($cacheFileExists && !$ignoreCache) {
-            DB::alteration_message('Cache file located. Populating DB from cached SQL file.');
-            $execCommand = sprintf(
-                "mysql --user=%s --password=%s %s < %s",
-                Environment::getEnv('SS_DATABASE_USERNAME'),
-                Environment::getEnv('SS_DATABASE_PASSWORD'),
-                Environment::getEnv('SS_DATABASE_NAME'),
-                $populateCacheFile
-            );
-
-            exec($execCommand, $output);
-            DB::alteration_message('Populate data imported using cached SQL file.');
+        if ($cacheEnabled && $cacheFileExists && !$ignoreCache) {
+            self::populateFromCache();
         } else {
             if ($cacheFileExists && $ignoreCache) {
                 DB::alteration_message('Task has been configured to ignore cached SQL file.');
             }
-            /** @var PopulateFactory $factory */
-            $factory = Injector::inst()->create(PopulateFactory::class);
 
-            foreach (self::config()->get('truncate_objects') as $className) {
-                self::truncateObject($className);
-            }
-
-            foreach (self::config()->get('truncate_tables') as $table) {
-                self::truncateTable($table);
-            }
-
-            foreach (self::config()->get('include_yaml_fixtures') as $fixtureFile) {
-                DB::alteration_message(sprintf('Processing %s', $fixtureFile), 'created');
-                $fixture = new YamlFixture($fixtureFile);
-                $fixture->writeInto($factory);
-
-                $fixture = null;
-            }
-
-            $factory->processFailedFixtures();
-
-            $populate = Injector::inst()->create(Populate::class);
-            $populate->extend('onAfterPopulateRecords');
+            self::populateFromYmlConfig();
         }
 
-        if (!$ignoreCache && !$cacheFileExists) {
+        if ($cacheEnabled && !$ignoreCache && !$cacheFileExists) {
             DB::alteration_message('No populate cache file found.');
 
             if ($cacheLocation) {
-                if (!file_exists($cacheLocation)) {
-                    DB::alteration_message(
-                        sprintf('Cache directory does not exist. Creating directory at `%s`.',$cacheLocation)
-                    );
-                    mkdir($cacheLocation);
-                }
-
-                $execCommand = sprintf(
-                    "mysqldump --user=%s --password=%s --host=%s %s --result-file=%s 2>&1",
-                    Environment::getEnv('SS_DATABASE_USERNAME'),
-                    Environment::getEnv('SS_DATABASE_PASSWORD'),
-                    Environment::getEnv('SS_DATABASE_SERVER'),
-                    Environment::getEnv('SS_DATABASE_NAME'),
-                    sprintf('%s%s.sql', $cacheLocation, $populateHash)
-                );
-
-                exec($execCommand, $output);
-
-                var_dump($output);
+                self::generatePopulateCacheFile($cacheLocation);
             } else {
                 DB::alteration_message('No cache file directory has been set. Populate cache file has not been created');
             }
-        } else {
+        } else if ($cacheEnabled) {
             DB::alteration_message('Skipping cached populate file creation - Populate cache file already exists.');
         }
 
@@ -196,7 +128,7 @@ class Populate
     private static function getPopulateHash(): string
     {
         $baseDir = Director::baseFolder();
-        $hashFiles = self::config()->get('populate_cache_hash_files');
+        $hashFiles = self::config()->get('cache_hash_files');
         $hashFiles = array_merge($hashFiles, self::config()->get('include_yaml_fixtures'));
 
         $hashFiles = array_map(function ($value) use ($baseDir) {
@@ -313,5 +245,143 @@ class Populate
 
         // Check if developer/s have specified that Populate can run on live
         return (bool)self::config()->get('allow_build_on_live');
+    }
+
+    /**
+     * Get the file path for a cache file based on configured `cache_files_location` and generated populate hash
+     * If `cache_files_location` starts with a / the file location is relative to the server root.
+     * If `cache_files_location` does not start with a / the location is relative to the sites base dir.
+     */
+    private static function getCacheFilePath(): string
+    {
+        $cacheLocation = self::config()->get('cache_files_location');
+        $populateHash = self::getPopulateHash();
+
+        if (str_starts_with($cacheLocation, '/')) {
+            $populateCacheFile = sprintf(
+                '%s%s%s.sql',
+                $cacheLocation,
+                str_ends_with($cacheLocation, '/') ? '' : '/',
+                $populateHash
+            );
+        } else {
+            $baseDir = Director::baseFolder();
+            $populateCacheFile = sprintf(
+                '%s/%s%s%s.sql',
+                $baseDir,
+                $cacheLocation,
+                str_ends_with($cacheLocation, '/') ? '' : '/',
+                $populateHash
+            );
+        }
+
+        return $populateCacheFile;
+    }
+
+    /**
+     * Execute mysql command to import database from cache file.
+     */
+    private static function populateFromCache(): void
+    {
+        $populateCacheFilePath = self::getCacheFilePath();
+
+        DB::alteration_message('Populating DB from cached SQL file.');
+        $execCommand = sprintf(
+            "mysql --user=%s --password=%s %s < %s",
+            Environment::getEnv('SS_DATABASE_USERNAME'),
+            Environment::getEnv('SS_DATABASE_PASSWORD'),
+            Environment::getEnv('SS_DATABASE_NAME'),
+            $populateCacheFilePath
+        );
+
+        exec($execCommand, $output);
+        DB::alteration_message('Populate data imported using cached SQL file.');
+    }
+
+    /**
+     * Populate database based on the yml configuration
+     */
+    private static function populateFromYmlConfig(): void
+    {
+        /** @var PopulateFactory $factory */
+        $factory = Injector::inst()->create(PopulateFactory::class);
+
+        foreach (self::config()->get('truncate_objects') as $className) {
+            self::truncateObject($className);
+        }
+
+        foreach (self::config()->get('truncate_tables') as $table) {
+            self::truncateTable($table);
+        }
+
+        foreach (self::config()->get('include_yaml_fixtures') as $fixtureFile) {
+            DB::alteration_message(sprintf('Processing %s', $fixtureFile), 'created');
+            $fixture = new YamlFixture($fixtureFile);
+            $fixture->writeInto($factory);
+
+            $fixture = null;
+        }
+
+        $factory->processFailedFixtures();
+
+        $populate = Injector::inst()->create(Populate::class);
+        $populate->extend('onAfterPopulateRecords');
+    }
+
+    private static function generatePopulateCacheFile(string $cacheLocation)
+    {
+        $populateHash = self::getPopulateHash();
+
+        if (!file_exists($cacheLocation)) {
+            DB::alteration_message(
+                sprintf('Cache directory does not exist. Creating directory at `%s`.',$cacheLocation)
+            );
+            mkdir($cacheLocation);
+        }
+
+        DB::alteration_message('Running `mysqldump` to create cache file.');
+        $execCommand = sprintf(
+            "mysqldump --user=%s --password=%s --host=%s %s --result-file=%s 2>&1",
+            Environment::getEnv('SS_DATABASE_USERNAME'),
+            Environment::getEnv('SS_DATABASE_PASSWORD'),
+            Environment::getEnv('SS_DATABASE_SERVER'),
+            Environment::getEnv('SS_DATABASE_NAME'),
+            sprintf('%s/%s.sql', $cacheLocation, $populateHash)
+        );
+
+        DB::alteration_message($execCommand);
+
+        exec($execCommand, $output);
+
+        var_dump($output);
+    }
+
+    /**
+     * Returns true if a cache file exists.
+     * If the overrideCache GET var is set, the existing cache file will be deleted and the function will return false
+     */
+    private static function cacheFileExists(): bool
+    {
+        $controller = Controller::curr();
+        $request = $controller->getRequest();
+        $overrideCache = $request->getVar('overrideCache');
+
+        $populateCacheFilePath = self::getCacheFilePath();
+        $cacheFileExists = file_exists($populateCacheFilePath);
+
+        if ($cacheFileExists) {
+            DB::alteration_message('Cache file located.');
+
+            if ($overrideCache) {
+                DB::alteration_message(
+                    sprintf('`cacheOverride` variable has been set. Deleting file `%s`', $populateCacheFilePath)
+                );
+
+                unlink($populateCacheFilePath);
+                return false;
+            }
+        }
+
+        return $cacheFileExists;
     }
 }
